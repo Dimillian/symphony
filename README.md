@@ -1,5 +1,9 @@
 # Symphony
 
+> Personal public fork-in-spirit of [openai/symphony](https://github.com/openai/symphony).
+> This repo keeps local workflow examples and machine-specific orchestration setup on top of the upstream project.
+> Upstream source of truth: [openai/symphony](https://github.com/openai/symphony).
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
