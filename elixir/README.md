@@ -37,8 +37,9 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
 5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
+  - To get your project's slug, right-click the project and copy its URL. Use the `slugId` suffix
+    from the project URL, not the full `<name>-<slugId>` segment.
+    Example: `https://linear.app/acme/project/my-project-abc123` uses `abc123`.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
@@ -72,6 +73,27 @@ Pass a custom workflow file path to `./bin/symphony` when starting the service:
 ```bash
 ./bin/symphony /path/to/custom/WORKFLOW.md
 ```
+
+This repository now also includes project-specific workflow examples:
+
+- `WORKFLOW.codexmonitor.md`
+- `WORKFLOW.pokeswift.md`
+
+To run either orchestrator with the standard built-in Symphony terminal UI, use one of these
+project-specific launchers:
+
+```bash
+cd elixir
+./scripts/run-codexmonitor-orchestrator.sh
+./scripts/run-pokeswift-orchestrator.sh
+```
+
+Each launcher expects `LINEAR_API_KEY` in the environment, a built `./bin/symphony`, and uses a
+dedicated logs root and dashboard port for that project.
+
+The project-specific `WORKFLOW.codexmonitor.md` and `WORKFLOW.pokeswift.md` examples are configured
+for `danger-full-access` Codex runs, so they can write Git metadata, generate project files, and
+run repository tooling without workspace-write sandbox restrictions.
 
 If no path is passed, Symphony defaults to `./WORKFLOW.md`.
 
