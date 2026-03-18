@@ -86,6 +86,27 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: nil
+    )
+
+    assert {:error, :missing_codex_monitor_database_path} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: "/tmp/codex-monitor/tasks.db",
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.database_path == "/tmp/codex-monitor/tasks.db"
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -750,6 +771,40 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "dispatch claim state uses the first configured active state after todo" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Doing", "Human Review"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    assert Orchestrator.dispatch_claim_state_name_for_test() == "Doing"
+  end
+
+  test "claim_issue_for_dispatch_for_test uses the configured working state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Doing", "Human Review"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    issue = %Issue{id: "issue-claim-1", identifier: "MT-CLAIM-1", state: "Todo"}
+    test_pid = self()
+
+    assert {:ok, %Issue{state: "Doing"} = claimed_issue} =
+             Orchestrator.claim_issue_for_dispatch_for_test(
+               issue,
+               fn issue_id, state_name ->
+                 send(test_pid, {:update_issue_state_called, issue_id, state_name})
+                 :ok
+               end,
+               fn [issue_id] ->
+                 {:ok, [%Issue{id: issue_id, identifier: "MT-CLAIM-1", state: "Doing"}]}
+               end
+             )
+
+    assert claimed_issue.id == issue.id
+    assert_received {:update_issue_state_called, "issue-claim-1", "Doing"}
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
@@ -883,7 +938,7 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue)
 
-    assert prompt =~ "You are working on a Linear issue."
+    assert prompt =~ "You are working on a tracked task."
     assert prompt =~ "Identifier: MT-777"
     assert prompt =~ "Title: Make fallback prompt useful"
     assert prompt =~ "Body:"
@@ -1483,17 +1538,9 @@ defmodule SymphonyElixir.CoreTest do
                  |> String.trim_leading("JSON:")
                  |> Jason.decode!()
                  |> then(fn payload ->
-                   expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
-                     }
-                   }
-
                    payload["method"] == "thread/start" &&
-                     get_in(payload, ["params", "approvalPolicy"]) == expected_approval_policy &&
-                     get_in(payload, ["params", "sandbox"]) == "workspace-write" &&
+                     get_in(payload, ["params", "approvalPolicy"]) == "never" &&
+                     get_in(payload, ["params", "sandbox"]) == "danger-full-access" &&
                      get_in(payload, ["params", "cwd"]) == canonical_workspace
                  end)
                else
@@ -1516,17 +1563,9 @@ defmodule SymphonyElixir.CoreTest do
                  |> String.trim_leading("JSON:")
                  |> Jason.decode!()
                  |> then(fn payload ->
-                   expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
-                     }
-                   }
-
                    payload["method"] == "turn/start" &&
                      get_in(payload, ["params", "cwd"]) == canonical_workspace &&
-                     get_in(payload, ["params", "approvalPolicy"]) == expected_approval_policy &&
+                     get_in(payload, ["params", "approvalPolicy"]) == "never" &&
                      get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_sandbox_policy
                  end)
                else

@@ -1,7 +1,29 @@
 defmodule SymphonyElixir.Codex.DynamicToolTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.{Codex.DynamicTool, CodexMonitor.Store}
+
+  defmodule FakeCodexMonitorStore do
+    def get_task_context(task_id) do
+      send(self(), {:get_task_context_called, task_id})
+      {:ok, %{"task" => %{"id" => task_id, "state" => "In Progress"}}}
+    end
+
+    def append_worklog(task_id, message) do
+      send(self(), {:append_worklog_called, task_id, message})
+      :ok
+    end
+
+    def update_issue_state(task_id, state_name) do
+      send(self(), {:update_issue_state_called, task_id, state_name})
+      :ok
+    end
+
+    def update_task_run(task_id, attrs) do
+      send(self(), {:update_task_run_called, task_id, attrs})
+      :ok
+    end
+  end
 
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
@@ -63,6 +85,230 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
     assert Jason.decode!(response["output"]) == %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
+  end
+
+  test "tool_specs advertises codex_monitor_task when the CodexMonitor tracker is active" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: "/tmp/codex-monitor/tasks.db",
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    assert [
+             %{
+               "description" => description,
+               "inputSchema" => %{"properties" => %{"action" => _}, "required" => ["action"]},
+               "name" => "codex_monitor_task"
+             }
+           ] = DynamicTool.tool_specs()
+
+    assert description =~ "CodexMonitor"
+  end
+
+  test "codex_monitor_task defaults to the current issue id and updates run metadata" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: "/tmp/codex-monitor/tasks.db",
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    response =
+      DynamicTool.execute(
+        "codex_monitor_task",
+        %{
+          "action" => "update_run",
+          "branchName" => "feature/task-1",
+          "lastEvent" => "implementation_complete",
+          "tokenTotal" => 456
+        },
+        codex_monitor_store: FakeCodexMonitorStore,
+        issue: %{id: "task-1"},
+        thread_id: "thread-1",
+        session_id: "thread-1-turn-1"
+      )
+
+    assert_received {:update_task_run_called, "task-1", attrs}
+    assert attrs[:branch_name] == "feature/task-1"
+    assert attrs[:last_event] == "implementation_complete"
+    assert attrs[:token_total] == 456
+    assert attrs[:thread_id] == "thread-1"
+    assert attrs[:session_id] == "thread-1-turn-1"
+    assert_received {:get_task_context_called, "task-1"}
+    assert response["success"] == true
+  end
+
+  test "codex_monitor_task updates state and appends worklog entries" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: "/tmp/codex-monitor/tasks.db",
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    response =
+      DynamicTool.execute(
+        "codex_monitor_task",
+        %{
+          "action" => "update_state",
+          "taskId" => "task-2",
+          "state" => "Human Review",
+          "message" => "Ready for operator review."
+        },
+        codex_monitor_store: FakeCodexMonitorStore
+      )
+
+    assert_received {:update_issue_state_called, "task-2", "Human Review"}
+    assert_received {:append_worklog_called, "task-2", "Ready for operator review."}
+    assert_received {:get_task_context_called, "task-2"}
+    assert response["success"] == true
+  end
+
+  test "codex monitor store creates the first task run from an empty task_runs table" do
+    db_path = create_codex_monitor_task_db!("task-1")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: db_path,
+      tracker_workspace_id: "ws-1",
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    assert :ok =
+             Store.update_task_run("task-1", %{
+               branch_name: "feature/task-1",
+               thread_id: "thread-1",
+               session_id: "thread-1-turn-1"
+             })
+
+    assert [
+             %{
+               "branch_name" => "feature/task-1",
+               "last_event" => nil,
+               "session_id" => "thread-1-turn-1",
+               "thread_id" => "thread-1"
+             }
+           ] =
+             sqlite_json!(
+               db_path,
+               """
+               SELECT thread_id, branch_name, session_id, last_event
+               FROM task_runs
+               WHERE task_id = 'task-1'
+               ORDER BY started_at_ms DESC
+               LIMIT 1
+               """
+             )
+  end
+
+  test "codex monitor store preserves existing run fields across sparse updates" do
+    db_path = create_codex_monitor_task_db!("task-1")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: db_path,
+      tracker_workspace_id: "ws-1",
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    assert :ok =
+             Store.update_task_run("task-1", %{
+               branch_name: "feature/task-1",
+               thread_id: "thread-1",
+               session_id: "thread-1-turn-1",
+               retry_count: 2,
+               token_total: 456
+             })
+
+    assert :ok = Store.update_task_run("task-1", %{last_event: "implementation_complete"})
+
+    assert [
+             %{
+               "branch_name" => "feature/task-1",
+               "last_event" => "implementation_complete",
+               "retry_count" => 2,
+               "session_id" => "thread-1-turn-1",
+               "thread_id" => "thread-1",
+               "token_total" => 456
+             }
+           ] =
+             sqlite_json!(
+               db_path,
+               """
+               SELECT thread_id, branch_name, session_id, last_event, retry_count, token_total
+               FROM task_runs
+               WHERE task_id = 'task-1'
+               ORDER BY started_at_ms DESC
+               LIMIT 1
+               """
+             )
+  end
+
+  test "codex monitor store creates a fresh task run when a new session starts" do
+    db_path = create_codex_monitor_task_db!("task-1")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: db_path,
+      tracker_workspace_id: "ws-1",
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    assert :ok =
+             Store.update_task_run("task-1", %{
+               branch_name: "feature/task-1",
+               thread_id: "thread-1",
+               session_id: "thread-1-turn-1",
+               token_total: 123
+             })
+
+    Process.sleep(5)
+
+    assert :ok =
+             Store.update_task_run("task-1", %{
+               thread_id: "thread-2",
+               session_id: "thread-2-turn-1"
+             })
+
+    assert [
+             %{
+               "branch_name" => "feature/task-1",
+               "session_id" => "thread-1-turn-1",
+               "thread_id" => "thread-1",
+               "token_total" => 123
+             },
+             %{
+               "branch_name" => "feature/task-1",
+               "session_id" => "thread-2-turn-1",
+               "thread_id" => "thread-2",
+               "token_total" => 123
+             }
+           ] =
+             sqlite_json!(
+               db_path,
+               """
+               SELECT thread_id, branch_name, session_id, token_total
+               FROM task_runs
+               WHERE task_id = 'task-1'
+               ORDER BY started_at_ms ASC
+               """
+             )
   end
 
   test "linear_graphql accepts a raw GraphQL query string" do
@@ -306,5 +552,60 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == true
     assert response["output"] == ":ok"
+  end
+
+  defp create_codex_monitor_task_db!(task_id, workspace_id \\ "ws-1") do
+    sqlite3_binary = System.find_executable("sqlite3") || raise "sqlite3 is required for this test"
+    root = Path.join(System.tmp_dir!(), "symphony-codex-monitor-#{System.unique_integer([:positive])}")
+    db_path = Path.join(root, "tasks.db")
+    File.mkdir_p!(root)
+
+    on_exit(fn -> File.rm_rf(root) end)
+
+    sql = """
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL,
+      order_index INTEGER NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE task_runs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      thread_id TEXT,
+      worktree_workspace_id TEXT,
+      branch_name TEXT,
+      pull_request_url TEXT,
+      session_id TEXT,
+      last_event TEXT,
+      last_message TEXT,
+      last_error TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      token_total INTEGER NOT NULL DEFAULT 0,
+      started_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+    INSERT INTO tasks (id, workspace_id, title, description, status, order_index, created_at_ms, updated_at_ms)
+    VALUES ('#{task_id}', '#{workspace_id}', 'Task', '', 'in_progress', 0, 0, 0);
+    """
+
+    {_, 0} = System.cmd(sqlite3_binary, [db_path, sql], stderr_to_stdout: true)
+    db_path
+  end
+
+  defp sqlite_json!(db_path, sql) do
+    sqlite3_binary = System.find_executable("sqlite3") || raise "sqlite3 is required for this test"
+    {output, 0} = System.cmd(sqlite3_binary, ["-json", db_path, sql], stderr_to_stdout: true)
+
+    case String.trim(output) do
+      "" -> []
+      trimmed -> Jason.decode!(trimmed)
+    end
   end
 end

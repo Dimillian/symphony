@@ -237,6 +237,10 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Linear project slug missing in WORKFLOW.md")
         state
 
+      {:error, :missing_codex_monitor_database_path} ->
+        Logger.error("CodexMonitor tracker database_path missing in WORKFLOW.md")
+        state
+
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
@@ -331,6 +335,23 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec dispatch_claim_state_name_for_test() :: String.t()
+  def dispatch_claim_state_name_for_test do
+    dispatch_claim_state_name()
+  end
+
+  @doc false
+  @spec claim_issue_for_dispatch_for_test(
+          Issue.t(),
+          (String.t(), String.t() -> :ok | {:error, term()}),
+          ([String.t()] -> {:ok, [Issue.t()]} | {:error, term()})
+        ) :: {:ok, Issue.t()} | {:error, term()}
+  def claim_issue_for_dispatch_for_test(%Issue{} = issue, update_issue_state_fun, issue_fetcher)
+      when is_function(update_issue_state_fun, 2) and is_function(issue_fetcher, 1) do
+    claim_issue_for_dispatch(issue, update_issue_state_fun, issue_fetcher)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -691,44 +712,67 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    dispatch_gate_ref = make_ref()
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           receive do
+             {:dispatch_start, ^dispatch_gate_ref, claimed_issue} ->
+               AgentRunner.run(claimed_issue, recipient, attempt: attempt, worker_host: worker_host)
+           after
+             5_000 ->
+               exit(:dispatch_start_timeout)
+           end
          end) do
       {:ok, pid} ->
-        ref = Process.monitor(pid)
+        case claim_issue_for_dispatch(issue, &Tracker.update_issue_state/2, &Tracker.fetch_issue_states_by_ids/1) do
+          {:ok, claimed_issue} ->
+            send(pid, {:dispatch_start, dispatch_gate_ref, claimed_issue})
+            ref = Process.monitor(pid)
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+            Logger.info("Dispatching issue to agent: #{issue_context(claimed_issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
-        running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
-          })
+            running =
+              Map.put(state.running, issue.id, %{
+                pid: pid,
+                ref: ref,
+                identifier: claimed_issue.identifier,
+                issue: claimed_issue,
+                worker_host: worker_host,
+                workspace_path: nil,
+                session_id: nil,
+                last_codex_message: nil,
+                last_codex_timestamp: nil,
+                last_codex_event: nil,
+                codex_app_server_pid: nil,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                codex_last_reported_input_tokens: 0,
+                codex_last_reported_output_tokens: 0,
+                codex_last_reported_total_tokens: 0,
+                turn_count: 0,
+                retry_attempt: normalize_retry_attempt(attempt),
+                started_at: DateTime.utc_now()
+              })
 
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
-        }
+            %{
+              state
+              | running: running,
+                claimed: MapSet.put(state.claimed, issue.id),
+                retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            }
+
+          {:error, reason} ->
+            Logger.warning("Failed to claim issue for dispatch: #{issue_context(issue)} reason=#{inspect(reason)}")
+            Process.exit(pid, :kill)
+            next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+            schedule_issue_retry(state, issue.id, next_attempt, %{
+              identifier: issue.identifier,
+              error: "failed to claim issue for dispatch: #{inspect(reason)}",
+              worker_host: worker_host
+            })
+        end
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -740,6 +784,43 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host
         })
     end
+  end
+
+  defp claim_issue_for_dispatch(%Issue{state: state_name} = issue, update_issue_state_fun, issue_fetcher)
+       when is_binary(state_name) do
+    if normalize_issue_state(state_name) == "todo" do
+      claim_todo_issue_for_dispatch(issue, update_issue_state_fun, issue_fetcher)
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp claim_issue_for_dispatch(issue, _update_issue_state_fun, _issue_fetcher), do: {:ok, issue}
+
+  defp claim_todo_issue_for_dispatch(%Issue{id: issue_id} = issue, update_issue_state_fun, issue_fetcher)
+       when is_binary(issue_id) and is_function(update_issue_state_fun, 2) and
+              is_function(issue_fetcher, 1) do
+    dispatch_state = dispatch_claim_state_name()
+
+    with :ok <- update_issue_state_fun.(issue_id, dispatch_state) do
+      case issue_fetcher.([issue_id]) do
+        {:ok, [%Issue{} = refreshed_issue | _]} ->
+          {:ok, refreshed_issue}
+
+        {:ok, _} ->
+          {:ok, %{issue | state: dispatch_state}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp dispatch_claim_state_name do
+    Config.settings!().tracker.active_states
+    |> Enum.find("In Progress", fn state_name ->
+      normalize_issue_state(state_name) != "todo"
+    end)
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
