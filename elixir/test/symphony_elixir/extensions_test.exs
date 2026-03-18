@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.Tracker.CodexMonitor, as: CodexMonitorTracker
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -203,6 +204,15 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "codex_monitor",
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_database_path: "/tmp/codex-monitor/tasks.db"
+    )
+
+    assert SymphonyElixir.Tracker.adapter() == CodexMonitorTracker
   end
 
   test "linear adapter delegates reads and validates mutation responses" do

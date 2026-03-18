@@ -50,6 +50,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:database_path, :string)
+      field(:workspace_id, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -59,7 +61,17 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :assignee,
+          :database_path,
+          :workspace_id,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
     end
@@ -158,18 +170,8 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
-
-      field(:approval_policy, StringOrMap,
-        default: %{
-          "reject" => %{
-            "sandbox_approval" => true,
-            "rules" => true,
-            "mcp_elicitations" => true
-          }
-        }
-      )
-
-      field(:thread_sandbox, :string, default: "workspace-write")
+      field(:approval_policy, StringOrMap, default: "never")
+      field(:thread_sandbox, :string, default: "danger-full-access")
       field(:turn_sandbox_policy, :map)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
@@ -369,7 +371,8 @@ defmodule SymphonyElixir.Config.Schema do
     tracker = %{
       settings.tracker
       | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE")),
+        database_path: resolve_path_value(settings.tracker.database_path, nil)
     }
 
     workspace = %{
@@ -434,6 +437,8 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_path_value(nil, default), do: default
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
